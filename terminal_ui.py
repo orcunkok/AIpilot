@@ -1,62 +1,66 @@
-"""Mock terminal layout using Python's standard-library curses. No AI calls."""
+"""Terminal viewer for the harness. Curses layout; Session is the submit path."""
 import curses
+import os
 import textwrap
 
+from adapter import OpenAIAdapter
+from harness import Event, Harness
 
-class Demo:
-    def __init__(self):
-        self.phase = 'Parked'
-        self.position = 'ALFA / Stand 1'
-        self.engine = 'Off'
-        self.clearances = ['Taxi via A; hold short runway 27', 'Takeoff: not cleared']
-        self.atc = ['Demo 12, taxi via Alpha, hold short runway 27.']
-        self.messages = [
-            ('SYSTEM', 'Mock preview · no AI or aircraft connected.'),
-            ('OPERATOR', 'Fly from ALFA to BRAVO.'),
-            ('AI', 'I’ll check the aircraft and prepare for departure.'),
-            ('TOOL', 'get_status()'),
-            ('RESULT', 'Parked at ALFA. Engine off. No faults.'),
-            ('ATC', self.atc[0]),
-            ('AI', 'Taxi clearance received. Takeoff still requires separate approval.'),
-        ]
-        self.stage = 0
+DEMO_ATC = 'Demo 12, taxi via Alpha, hold short runway 27.'
+
+
+class Session:
+    def __init__(self, harness):
+        self.harness = harness
+        self.messages = [('SYSTEM', 'Type a message · /atc TEXT · /demo injects taxi ATC · /clear · q quits.')]
+        if not os.environ.get('OPENAI_API_KEY'):
+            self.messages.append(('SYSTEM', 'OPENAI_API_KEY is empty. Wakes will fail until it is set.'))
+        self._seen = 0
 
     def submit(self, text):
+        text = (text or '').strip()
         if text in {'q', '/quit', '/exit'}:
             return False
         if text == '/clear':
             self.messages.clear()
-        elif text == '/help':
-            self.messages.append(('SYSTEM', 'Type a message · /atc TEXT · /demo advances the mock · /clear · q quits. PgUp/PgDn scroll; Up/Down recall input.'))
-        elif text.startswith('/atc '):
-            message = text[5:].strip()
-            self.atc.append(message)
-            self.messages.extend([('ATC', message), ('SYSTEM', 'Transcript displayed only; mock clearances unchanged.')])
-        elif text == '/demo':
-            self.advance()
-        else:
-            self.messages.extend([('OPERATOR', text), ('AI', 'Message received. This is a layout preview; /demo shows mock tool execution.')])
+            return True
+        if text == '/help':
+            self.messages.append(('SYSTEM', 'Type a message · /atc TEXT · /demo injects taxi ATC · /clear · q quits.'))
+            return True
+        if text == '/demo':
+            return self._wake(Event('atc', DEMO_ATC, clearance=DEMO_ATC))
+        if text == '/atc' or text.startswith('/atc '):
+            message = text[4:].strip()
+            if not message:
+                self.messages.append(('SYSTEM', 'Usage: /atc TEXT'))
+                return True
+            return self._wake(Event('atc', message, clearance=message))
+        if text.startswith('/'):
+            self.messages.append(('SYSTEM', 'Unknown command. Type /help.'))
+            return True
+        return self._wake(Event('operator', text))
+
+    def _wake(self, event):
+        self.messages.append(('SYSTEM', 'waking…'))
+        try:
+            self.harness.wake(event)
+        except Exception as error:
+            self.messages.append(('SYSTEM', f'wake failed: {error}'))
+            return True
+        self.messages.extend(self.harness.transcript[self._seen:])
+        self._seen = len(self.harness.transcript)
         return True
 
-    def advance(self):
-        if self.stage == 0:
-            self.messages.extend([('AI', 'Starting the aircraft for taxi.'), ('TOOL', 'start_aircraft()'), ('ACTION', 'A001 accepted → executing'), ('RESULT', 'A001 completed · engine running')])
-            self.engine = 'Running'
-        elif self.stage == 1:
-            self.messages.extend([('AI', 'Taxiing to the cleared holding point.'), ('TOOL', 'taxi(route="A", destination="hold_short_27")'), ('ACTION', 'A002 accepted → executing'), ('RESULT', 'A002 completed · holding short runway 27')])
-            self.position, self.phase = 'ALFA / Runway 27', 'Holding short'
-            self.clearances = ['Taxi: completed', 'Takeoff: not cleared']
-        elif self.stage == 2:
-            self.messages.extend([('TOOL', 'send_atc("Demo 12, ready for departure.")'), ('ACTION', 'Transmission sent · awaiting clearance'), ('ATC', 'Demo 12, cleared for takeoff runway 27.'), ('AI', 'Cleared for takeoff runway 27, Demo 12.')])
-            self.atc.append('Demo 12, cleared for takeoff runway 27.')
-            self.clearances = ['Takeoff runway 27 · read back']
-        else:
-            self.messages.append(('SYSTEM', 'End of mock preview. Type /atc followed by a message, or q to quit.'))
-        self.stage += 1
+
+def make_session(harness=None):
+    if harness is None:
+        harness = Harness(OpenAIAdapter(), run_id='ui')
+    return Session(harness)
 
 
-def run(screen):
-    demo = Demo()
+def run(screen, session=None):
+    session = session or make_session()
+    world = session.harness.world
     colors = {}
     if curses.has_colors():
         curses.start_color()
@@ -76,7 +80,6 @@ def run(screen):
         h, w = screen.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        # Keep pasted control characters out of the screen renderer.
         value = ''.join(c if c.isprintable() else ' ' for c in str(value))
         try:
             screen.addnstr(y, x, value, max(0, min(w-x-1, limit if limit is not None else w)), attr)
@@ -91,29 +94,31 @@ def run(screen):
         body_width = max(8, w-left-2)
         body_height = max(1, h-8)
         put(0, 2, 'FLIGHTOPS', curses.A_BOLD | colors.get('AI', 0))
-        put(0, 15, 'MOCK · terminal preview', curses.A_DIM)
+        put(0, 15, 'harness', curses.A_DIM)
         if sidebar:
             for y in range(2, max(2,h-5)):
                 put(y, sidebar, '│', curses.A_DIM)
             y = 2
+            clearances = world.clearances or ['none']
+            latest = session.harness.atc_log[-2:] or ['none']
             sections = [
-                ('AIRCRAFT', ['Demo 12 · ALFA → BRAVO', demo.phase, demo.position, 'Altitude  0 ft', 'Speed     0 kt', 'Engine    '+demo.engine, 'Gear down · brake set' if demo.stage < 2 else 'Gear down · brake released']),
-                ('CLEARANCES', demo.clearances),
-                ('LATEST ATC', demo.atc[-2:]),
+                ('AIRCRAFT', [f'{world.callsign} · {world.mission}', world.phase, world.position, 'Engine    '+world.engine]),
+                ('CLEARANCES', clearances),
+                ('LATEST ATC', latest),
             ]
             for title, values in sections:
                 if y >= h-5: break
                 put(y, 2, title, curses.A_BOLD, sidebar-4)
                 y += 1
                 for value in values:
-                    for part in textwrap.wrap(value, sidebar-5) or ['']:
+                    for part in textwrap.wrap(str(value), sidebar-5) or ['']:
                         if y >= h-5: break
                         put(y, 2, part, colors.get('ATC',0) if title=='LATEST ATC' else curses.A_DIM, sidebar-4)
                         y += 1
                 y += 1
         put(2, left, 'CONVERSATION', curses.A_BOLD)
         rows = []
-        for kind, message in demo.messages:
+        for kind, message in session.messages:
             nested = kind in {'TOOL', 'RESULT', 'ACTION'}
             prefix = ('    ↳ ' if nested else '') + kind.lower() + '  '
             continuation = ' ' * len(prefix)
@@ -146,7 +151,7 @@ def run(screen):
             message = text.strip()
             if message:
                 history.append(message)
-                if not demo.submit(message): break
+                if not session.submit(message): break
             text, cursor, scroll, draft = '', 0, 0, ''
             history_index = len(history)
         elif key in ('\x03','\x04'):

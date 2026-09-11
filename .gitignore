@@ -2,3 +2,4 @@
 .env
 .venv
 /runs
+/tests/__pycache__

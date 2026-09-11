@@ -19,8 +19,19 @@ def use_venv():
         os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-def plain_terminal():
-    # Standard-library readline provides input editing and session history on Linux/macOS.
+def load_env():
+    path = ROOT / '.env'
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def plain_terminal(session):
     try:
         import readline  # noqa: F401
     except ImportError:
@@ -30,6 +41,11 @@ def plain_terminal():
     cyan, reset = ('\033[36m', '\033[0m') if color else ('', '')
     print(f'\n  {cyan}Flightops{reset}')
     print('  Type a message. /help for commands. q or /quit to exit.\n')
+    shown = 0
+    for kind, text in session.messages:
+        print(f'  {kind.lower()}  {text}')
+        shown += 1
+    print()
     while True:
         try:
             message = input('  flightops > ').strip()
@@ -41,27 +57,28 @@ def plain_terminal():
             continue
         if not message:
             continue
-        if message in {'q', '/quit', '/exit'}:
+        if not session.submit(message):
             print('  Goodbye.')
             break
-        if message == '/help':
-            print('  /help  Show commands\n  /clear Clear screen\n  q /quit  Exit\n')
-        elif message == '/clear':
-            if sys.stdout.isatty():
-                print('\033[2J\033[H', end='', flush=True)
-        elif message.startswith('/'):
-            print('  Unknown command. Type /help.\n')
-        else:
-            print(f'  Received: {message}\n')
+        if len(session.messages) < shown:
+            shown = 0
+        for kind, text in session.messages[shown:]:
+            print(f'  {kind.lower()}  {text}')
+        shown = len(session.messages)
+        print()
 
 
 def main():
+    load_env()
+    from terminal_ui import make_session, run
+    session = make_session()
+    if not os.environ.get('OPENAI_API_KEY'):
+        print('OPENAI_API_KEY is empty. UI will open; wakes will fail until it is set.', flush=True)
     if sys.stdin.isatty() and sys.stdout.isatty() and os.getenv('TERM', '') not in {'', 'dumb'}:
         import curses
-        from terminal_ui import run
-        curses.wrapper(run)
+        curses.wrapper(lambda screen: run(screen, session))
     else:
-        plain_terminal()
+        plain_terminal(session)
 
 
 if __name__ == '__main__':
